@@ -17,34 +17,70 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Show msbuild info
+      - name: Locate MSBuild (vswhere) and show info
         shell: powershell
         run: |
-          $ms = Get-Command msbuild -ErrorAction SilentlyContinue
-          if ($null -ne $ms) {
-            Write-Host "msbuild found at: $($ms.Path)"
-            & msbuild -version
+          Write-Host "Locating MSBuild using vswhere..."
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-Not (Test-Path $vswhere)) {
+            Write-Host "vswhere not found at $vswhere; attempting common Visual Studio locations..."
+          }
+          # try vswhere
+          $msbuildPath = ""
+          if (Test-Path $vswhere) {
+            $msbuildPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe 2>$null
+            $msbuildPath = $msbuildPath.Trim()
+          }
+          if (-not $msbuildPath) {
+            # try common path for VS2022/2019
+            $cands = @(
+              "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe",
+              "C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe",
+              "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe",
+              "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
+            )
+            foreach ($p in $cands) { if (Test-Path $p) { $msbuildPath = $p; break } }
+          }
+          if (-not $msbuildPath) {
+            Write-Host "MSBuild not found via vswhere or common locations. Attempting to initialize Developer Command Prompt..."
+            $vsdev = Get-ChildItem 'C:\Program Files (x86)\Microsoft Visual Studio' -Recurse -Filter 'VsDevCmd.bat' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($vsdev) {
+              Write-Host "Sourcing VsDevCmd: $($vsdev.FullName)"
+              & "$($vsdev.FullName)" -arch=amd64
+              # try vswhere again
+              if (Test-Path $vswhere) {
+                $msbuildPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe 2>$null
+                $msbuildPath = $msbuildPath.Trim()
+              }
+            }
+          }
+          if (-not $msbuildPath) {
+            Write-Error "MSBuild not found on runner. Abort."
+            exit 1
           } else {
-            Write-Host "msbuild not found in PATH"
+            Write-Host "MSBuild located at: $msbuildPath"
+            & "$msbuildPath" /version
           }
 
       - name: Build solution with MSBuild (Release; try x64 then Win32)
         shell: powershell
         run: |
           $sln = Join-Path $PWD "platform\win32\mupdf.sln"
-          if (-Not (Test-Path $sln)) {
-            Write-Error "Solution not found: $sln"
-            exit 1
+          if (-Not (Test-Path $sln)) { Write-Error "Solution not found: $sln"; exit 1 }
+          # locate MSBuild (reuse vswhere logic)
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuildPath = ""
+          if (Test-Path $vswhere) { $msbuildPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe 2>$null; $msbuildPath=$msbuildPath.Trim() }
+          if (-not $msbuildPath) {
+            $msbuildPath = "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
           }
-          Write-Host "Attempting MSBuild (Release / x64): $sln"
-          & msbuild $sln /p:Configuration=Release /p:Platform=x64 /m
+          if (-not (Test-Path $msbuildPath)) { Write-Error "MSBuild not found at $msbuildPath"; exit 1 }
+          Write-Host "Using MSBuild: $msbuildPath"
+          & "$msbuildPath" $sln /p:Configuration=Release /p:Platform=x64 /m
           if ($LASTEXITCODE -ne 0) {
             Write-Host "x64 build failed (exit $LASTEXITCODE). Trying Win32..."
-            & msbuild $sln /p:Configuration=Release /p:Platform=Win32 /m
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "MSBuild failed for both x64 and Win32 (exit $LASTEXITCODE). See logs."
-              exit $LASTEXITCODE
-            }
+            & "$msbuildPath" $sln /p:Configuration=Release /p:Platform=Win32 /m
+            if ($LASTEXITCODE -ne 0) { Write-Error "MSBuild failed for both x64 and Win32 (exit $LASTEXITCODE)"; exit $LASTEXITCODE }
           }
 
       - name: Collect executables and package
