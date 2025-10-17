@@ -86,26 +86,33 @@ jobs:
       - name: Collect executables and package
         shell: powershell
         run: |
+          # Collect executables and package (fixed)
           $out = Join-Path $PWD "out"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-
+          
           # Find executables (exclude .git)
           $exes = Get-ChildItem -Path $PWD -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue |
                   Where-Object { $_.FullName -notmatch '\\.git\\' -and $_.Length -gt 0 }
-
+          
           if ($null -eq $exes -or $exes.Count -eq 0) {
             Write-Host "No executables found after build. Listing top-level directories for debug:"
             Get-ChildItem -Path $PWD -Recurse -Depth 2 | Select-Object -First 200
             throw "No executables found"
           }
-
+          
           foreach ($f in $exes) {
             Copy-Item -Path $f.FullName -Destination (Join-Path $out $f.Name) -Force
           }
-
-          # Create zip
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          [System.IO.Compression.ZipFile]::CreateFromDirectory($out, "$out\mupdf-windows-full.zip")
+          
+          # Create zip OUTSIDE the out folder, then move it in
+          $zipTemp = Join-Path $PWD "mupdf-windows-full.zip"
+          if (Test-Path $zipTemp) { Remove-Item $zipTemp -Force }
+          # Use Compress-Archive (built-in) which supports -Force
+          Compress-Archive -Path (Join-Path $out "*") -DestinationPath $zipTemp -Force
+          
+          # Move zip into out
+          Move-Item -Path $zipTemp -Destination (Join-Path $out "mupdf-windows-full.zip") -Force
+          
           Get-ChildItem -Path $out
 
       - name: Upload Windows artifact
