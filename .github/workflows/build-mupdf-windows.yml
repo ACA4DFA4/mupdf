@@ -1,0 +1,79 @@
+name: build-mupdf-windows
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build full MuPDF (Windows, MSVC)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Show msbuild info
+        shell: powershell
+        run: |
+          $ms = Get-Command msbuild -ErrorAction SilentlyContinue
+          if ($null -ne $ms) {
+            Write-Host "msbuild found at: $($ms.Path)"
+            & msbuild -version
+          } else {
+            Write-Host "msbuild not found in PATH"
+          }
+
+      - name: Build solution with MSBuild (Release; try x64 then Win32)
+        shell: powershell
+        run: |
+          $sln = Join-Path $PWD "platform\win32\mupdf.sln"
+          if (-Not (Test-Path $sln)) {
+            Write-Error "Solution not found: $sln"
+            exit 1
+          }
+          Write-Host "Attempting MSBuild (Release / x64): $sln"
+          & msbuild $sln /p:Configuration=Release /p:Platform=x64 /m
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "x64 build failed (exit $LASTEXITCODE). Trying Win32..."
+            & msbuild $sln /p:Configuration=Release /p:Platform=Win32 /m
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "MSBuild failed for both x64 and Win32 (exit $LASTEXITCODE). See logs."
+              exit $LASTEXITCODE
+            }
+          }
+
+      - name: Collect executables and package
+        shell: powershell
+        run: |
+          $out = Join-Path $PWD "out"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          # Find executables (exclude .git)
+          $exes = Get-ChildItem -Path $PWD -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -notmatch '\\.git\\' -and $_.Length -gt 0 }
+
+          if ($null -eq $exes -or $exes.Count -eq 0) {
+            Write-Host "No executables found after build. Listing top-level directories for debug:"
+            Get-ChildItem -Path $PWD -Recurse -Depth 2 | Select-Object -First 200
+            throw "No executables found"
+          }
+
+          foreach ($f in $exes) {
+            Copy-Item -Path $f.FullName -Destination (Join-Path $out $f.Name) -Force
+          }
+
+          # Create zip
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($out, "$out\mupdf-windows-full.zip")
+          Get-ChildItem -Path $out
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mupdf-windows
+          path: out/*
