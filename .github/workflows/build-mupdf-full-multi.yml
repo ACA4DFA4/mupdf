@@ -1,0 +1,187 @@
+name: build-mupdf-full-multi
+
+on:
+  push:
+    tags:
+      - 'v*'          # push tag v* 会触发 release job
+  workflow_dispatch:  # 手动触发
+
+jobs:
+  ubuntu-build-and-cross:
+    name: Ubuntu 22.04 — Full build (Linux) + cross-build (Windows exe)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repo (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install apt build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git pkg-config cmake ninja-build \
+            mingw-w64 \
+            libjpeg-dev libfreetype6-dev libopenjp2-7-dev zlib1g-dev libpng-dev \
+            ca-certificates python3 zip unzip
+          gcc --version
+          x86_64-w64-mingw32-gcc --version
+
+      - name: Full native build (Linux)
+        run: |
+          # 全量构建整个项目（可产生 viewer/lib 等全部产物）
+          make -j$(nproc)
+          # 确认 mutool 可执行
+          if [ -f build/release/mutool ]; then
+            ./build/release/mutool -v || true
+          fi
+
+      - name: Package full Linux build
+        run: |
+          mkdir -p out
+          if [ -d build/release ]; then
+            tar -C build/release -czf out/mupdf-linux-full.tar.gz .
+          fi
+          ls -la out || true
+
+      - name: Archive generated files (for reuse in cross build)
+        run: |
+          mkdir -p tmp_generated
+          if [ -d build/release/generated ]; then
+            cp -a build/release/generated tmp_generated/
+          fi
+          tar -czf generated.tar.gz tmp_generated || true
+          ls -la
+
+      - name: Clean (prepare for cross build)
+        run: |
+          make clean || true
+
+      - name: Unpack generated for cross build
+        run: |
+          tar -xzf generated.tar.gz || true
+          if [ -d tmp_generated/generated ]; then
+            mkdir -p build/release
+            cp -a tmp_generated/generated build/release/
+          fi
+          ls -la build/release || true
+
+      - name: Cross-compile Windows exe (mingw-w64)
+        run: |
+          export CC=x86_64-w64-mingw32-gcc
+          export CXX=x86_64-w64-mingw32-g++
+          export AR=x86_64-w64-mingw32-ar
+          export RANLIB=x86_64-w64-mingw32-ranlib
+          # 如果你将来需要 static 声明或额外 LDFLAGS，可在下面追加
+          make -j$(nproc) tools CC=$CC CXX=$CXX AR=$AR RANLIB=$RANLIB build=release || true
+          ls -la build/release || true
+
+      - name: Package cross-built Windows exe
+        run: |
+          mkdir -p out
+          if [ -f build/release/mutool.exe ]; then
+            cp build/release/mutool.exe out/mutool-windows-cross.exe
+            zip -j out/mutool-windows-cross.zip out/mutool-windows-cross.exe || true
+          else
+            echo "mutool.exe not found in build/release - cross build may have failed"
+            ls -la build/release || true
+          fi
+          ls -la out
+
+      - name: Upload Ubuntu artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mupdf-ubuntu-artifacts
+          path: out/*
+
+  windows-msvc:
+    name: Windows runner — Native MSVC build (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repo (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show msbuild info
+        shell: powershell
+        run: |
+          Write-Host "msbuild location and version"
+          where msbuild || Write-Host "msbuild not found in PATH"
+          msbuild -version || Write-Host "msbuild -version returned non-zero"
+
+      - name: Build solution with MSBuild (try x64, fallback Win32)
+        shell: powershell
+        run: |
+          $sln = Join-Path $PWD "platform\win32\mupdf.sln"
+          Write-Host "Attempt to build (Release / x64): $sln"
+          msbuild $sln /p:Configuration=Release /p:Platform=x64 /m
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "x64 build failed, try Win32..."
+            msbuild $sln /p:Configuration=Release /p:Platform=Win32 /m
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "MSBuild failed for both x64 and Win32 (see log)"
+              exit 1
+            }
+          }
+
+      - name: Locate and package mutool.exe (MSVC build)
+        shell: powershell
+        run: |
+          # 搜索 mutool 可执行并压缩
+          $found = Get-ChildItem -Path $PWD -Filter "mutool.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $found) {
+            Write-Error "mutool.exe not found after MSBuild. Search entire tree for files named mutool*.exe:"
+            Get-ChildItem -Path $PWD -Filter "mutool*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
+            exit 1
+          }
+          $outdir = Join-Path $PWD "out"
+          New-Item -ItemType Directory -Force -Path $outdir | Out-Null
+          Copy-Item -Path $found.FullName -Destination (Join-Path $outdir "mutool-windows-msvc.exe")
+          # zip
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($outdir, "$outdir\mutool-windows-msvc.zip")
+          Get-ChildItem -Path $outdir
+
+      - name: Upload Windows (MSVC) artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mupdf-windows-msvc
+          path: out/*
+
+  release:
+    name: Create GitHub Release and attach artifacts (on tag)
+    runs-on: ubuntu-22.04
+    needs: [ubuntu-build-and-cross, windows-msvc]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download ubuntu artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mupdf-ubuntu-artifacts
+          path: ./release_assets/ubuntu || true
+
+      - name: Download windows (msvc) artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mupdf-windows-msvc
+          path: ./release_assets/windows || true
+
+      - name: List release assets
+        run: |
+          ls -R release_assets || true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release_assets/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
