@@ -1,0 +1,52 @@
+name: build-mupdf-linux
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build full MuPDF (Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install apt deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git pkg-config cmake ninja-build \
+            libjpeg-dev libfreetype6-dev libopenjp2-7-dev zlib1g-dev libpng-dev \
+            ca-certificates python3
+          gcc --version
+
+      - name: Full native build (Linux)
+        run: |
+          # 全量构建
+          make -j$(nproc)
+          # 确认 mutool
+          if [ -f build/release/mutool ]; then
+            ./build/release/mutool -v || true
+          fi
+
+      - name: Package Linux build
+        run: |
+          mkdir -p out
+          if [ -d build/release ]; then
+            tar -C build/release -czf out/mupdf-linux-full.tar.gz .
+          else
+            echo "Warning: build/release not found"
+          fi
+          ls -la out || true
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mupdf-linux
+          path: out/*
